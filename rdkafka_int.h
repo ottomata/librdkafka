@@ -119,6 +119,7 @@ struct rd_kafka_conf_s {
 	 * Generic configuration
 	 */
 	int     max_msg_size;
+        int     recv_max_msg_size;
 	int     metadata_request_timeout_ms;
 	int     metadata_refresh_interval_ms;
 	int     metadata_refresh_fast_cnt;
@@ -137,6 +138,7 @@ struct rd_kafka_conf_s {
 	 */
 	int    queued_min_msgs;
 	int    fetch_wait_max_ms;
+        int    fetch_msg_max_bytes;
 	int    fetch_min_bytes;
 	int    fetch_error_backoff_ms;
 	/* Pre-built Fetch request header. */
@@ -149,7 +151,6 @@ struct rd_kafka_conf_s {
 	int    queue_buffering_max_msgs;
 	int    buffering_max_ms;
 	int    max_retries;
-	int    msg_send_max_retries;
 	int    retry_backoff_ms;
 	int    batch_num_messages;
 	rd_kafka_compression_t compression_codec;
@@ -430,6 +431,7 @@ typedef struct rd_kafka_broker_s {
 		uint64_t rx_bytes;
 		uint64_t rx;    /* Kafka messages (not payload msgs) */
 		uint64_t rx_err;
+                uint64_t rx_corrid_err; /* CorrId misses */
 	} rkb_c;
 
 	rd_ts_t             rkb_ts_metadata_poll; /* Next metadata poll time */
@@ -490,6 +492,9 @@ struct rd_kafka_topic_s {
 		RD_KAFKA_TOPIC_S_UNKNOWN,
 	} rkt_state;
 
+        int                rkt_flags;
+#define RD_KAFKA_TOPIC_F_LEADER_QUERY  0x1 /* There is an outstanding
+                                            * leader query for this topic */
 	struct rd_kafka_s *rkt_rk;
 
 	rd_kafka_topic_conf_t rkt_conf;

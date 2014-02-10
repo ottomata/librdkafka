@@ -867,8 +867,12 @@ static void rd_kafka_broker_metadata_reply (rd_kafka_broker_t *rkb,
 	}
 
 done:
-	if (rkt)
+	if (rkt) {
+                rd_kafka_topic_wrlock(rkt);
+                rkt->rkt_flags &= ~RD_KAFKA_TOPIC_F_LEADER_QUERY;
+                rd_kafka_topic_unlock(rkt);
 		rd_kafka_topic_destroy0(rkt);
+        }
 
 	rd_kafka_buf_destroy(request);
 	if (reply)
@@ -903,8 +907,10 @@ static void rd_kafka_broker_metadata_req (rd_kafka_broker_t *rkb,
 	 * be performed by the broker thread. */
 	if (pthread_self() != rkb->rkb_thread) {
 		rd_kafka_op_t *rko = rd_kafka_op_new(RD_KAFKA_OP_METADATA_REQ);
-		rko->rko_rkt = only_rkt;
-                rd_kafka_topic_keep(only_rkt);
+                if (only_rkt) {
+                        rko->rko_rkt = only_rkt;
+                        rd_kafka_topic_keep(only_rkt);
+                }
 		rd_kafka_q_enq(&rkb->rkb_ops, rko);
 		rd_rkb_dbg(rkb, METADATA, "METADATA",
 			   "Request metadata: scheduled: not in broker thread");
@@ -1023,6 +1029,19 @@ void rd_kafka_topic_leader_query0 (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
 	if (do_rk_lock)
 		rd_kafka_unlock(rk);
 
+        if (rkt) {
+                rd_kafka_topic_wrlock(rkt);
+                /* Avoid multiple leader queries if there is already
+                 * an outstanding one waiting for reply. */
+                if (rkt->rkt_flags & RD_KAFKA_TOPIC_F_LEADER_QUERY) {
+                        rd_kafka_topic_unlock(rkt);
+                        rd_kafka_broker_destroy(rkb);
+                        return;
+                }
+                rkt->rkt_flags |= RD_KAFKA_TOPIC_F_LEADER_QUERY;
+                rd_kafka_topic_unlock(rkt);
+        }
+
 	rd_kafka_broker_metadata_req(rkb, 0, rkt, "leader query");
 
 	/* Release refcnt from rd_kafka_broker_any() */
@@ -1069,27 +1088,19 @@ static int rd_kafka_req_response (rd_kafka_broker_t *rkb,
 	if (unlikely(!(req =
 		       rd_kafka_waitresp_find(rkb,
 					      rkbuf->rkbuf_reshdr.CorrId)))) {
-		/* FIXME: unknown response. probably due to request timeout */
+		/* unknown response. probably due to request timeout */
+                rkb->rkb_c.rx_corrid_err++;
 		rd_rkb_dbg(rkb, BROKER, "RESPONSE",
-			   "Unknown response for CorrId %"PRId32,
+			   "Response for unknown CorrId %"PRId32" (timed out?)",
 			   rkbuf->rkbuf_reshdr.CorrId);
-		goto err;
+                rd_kafka_buf_destroy(rkbuf);
+                return -1;
 	}
-
 
 	/* Call callback. Ownership of 'rkbuf' is delegated to callback. */
 	req->rkbuf_cb(rkb, 0, rkbuf, req, req->rkbuf_opaque);
 
 	return 0;
-
-err:
-	/* FIXME */
-	rd_rkb_dbg(rkb, BROKER, "RESP",
-		   "Response error for corrid %"PRId32,
-		   rkbuf->rkbuf_reshdr.CorrId);
-
-	rd_kafka_buf_destroy(rkbuf);
-	return -1;
 }
 
 
@@ -1239,16 +1250,12 @@ static int rd_kafka_recv (rd_kafka_broker_t *rkb) {
 		rkbuf->rkbuf_len = ntohl(rkbuf->rkbuf_reshdr.Size);
 		rkbuf->rkbuf_reshdr.CorrId = ntohl(rkbuf->rkbuf_reshdr.CorrId);
 
-		/* Make sure message size is within tolerable limits.
-		 * Allow extra space for header overhead.
-                 * For example, a fetch response for 10 partitions
-                 * will have an overhead of the (framing headers * 10). */
+		/* Make sure message size is within tolerable limits. */
 		if (rkbuf->rkbuf_len < 4/*CorrId*/ ||
-		    rkbuf->rkbuf_len >
-		    rkb->rkb_rk->rk_conf.max_msg_size + 100000) {
+		    rkbuf->rkbuf_len > rkb->rkb_rk->rk_conf.recv_max_msg_size) {
 			snprintf(errstr, sizeof(errstr),
 				 "Invalid message size %zd (0..%i): "
-				 "increase message.max.bytes",
+				 "increase receive.message.max.bytes",
 				 rkbuf->rkbuf_len-4,
 				 rkb->rkb_rk->rk_conf.max_msg_size);
 			rkb->rkb_c.rx_err++;
@@ -1580,7 +1587,7 @@ static void rd_kafka_produce_msgset_reply (rd_kafka_broker_t *rkb,
 		   request->rkbuf_msgq.rkmq_msg_cnt, err ? "not ": "");
 
 	/* Parse Produce reply (unless the request errored) */
-	if (!err)
+	if (!err && reply)
 		err = rd_kafka_produce_reply_handle(rkb, reply);
 
 
@@ -1600,13 +1607,14 @@ static void rd_kafka_produce_msgset_reply (rd_kafka_broker_t *rkb,
 			break;
 
 		case RD_KAFKA_RESP_ERR_REQUEST_TIMED_OUT:
+                case RD_KAFKA_RESP_ERR__MSG_TIMED_OUT:
 			/* Try again */
 			if (++request->rkbuf_retries <
 			    rkb->rkb_rk->rk_conf.max_retries) {
 
 				if (reply)
 					rd_kafka_buf_destroy(reply);
-							
+
 				rd_kafka_broker_buf_retry(rkb, request);
 				return;
 			}
@@ -2084,9 +2092,6 @@ static void rd_kafka_broker_op_serve (rd_kafka_broker_t *rkb,
 				      rd_kafka_op_t *rko) {
 
 	assert(pthread_self() == rkb->rkb_thread);
-
-	rd_rkb_dbg(rkb, BROKER, "BRKOP",
-		   "Serve broker op type %i", rko->rko_type);
 
 	switch (rko->rko_type)
 	{
@@ -2796,7 +2801,7 @@ static void rd_kafka_broker_fetch_reply (rd_kafka_broker_t *rkb,
 	rkb->rkb_fetching = 0;
 
 	/* Parse and handle the messages (unless the request errored) */
-	if (!err)
+	if (!err && reply)
 		err = rd_kafka_fetch_reply_handle(rkb, reply);
 
 	rd_rkb_dbg(rkb, MSG, "FETCH", "Fetch reply: %s",
@@ -2816,7 +2821,10 @@ static void rd_kafka_broker_fetch_reply (rd_kafka_broker_t *rkb,
 
 		case RD_KAFKA_RESP_ERR__TRANSPORT:
 		case RD_KAFKA_RESP_ERR_REQUEST_TIMED_OUT:
+                case RD_KAFKA_RESP_ERR__MSG_TIMED_OUT:
 			/* Try again */
+                        /* FIXME: Not sure we should retry here, the fetch
+                         *        is already intervalled. */
 			if (++request->rkbuf_retries <
 			    /* FIXME: producer? */
 			    rkb->rkb_rk->rk_conf.max_retries) {
@@ -2933,7 +2941,7 @@ static void rd_kafka_toppar_offset_reply (rd_kafka_broker_t *rkb,
 	rd_kafka_toppar_t *rktp = opaque;
 	rd_kafka_op_t *rko;
 
-	if (likely(!err))
+	if (likely(!err && reply))
 		err = rd_kafka_toppar_offset_reply_handle(rkb, reply, rktp);
 
 	rd_rkb_dbg(rkb, TOPIC, "OFFSET",
@@ -2956,6 +2964,7 @@ static void rd_kafka_toppar_offset_reply (rd_kafka_broker_t *rkb,
 
 		case RD_KAFKA_RESP_ERR__TRANSPORT:
 		case RD_KAFKA_RESP_ERR_REQUEST_TIMED_OUT:
+                case RD_KAFKA_RESP_ERR__MSG_TIMED_OUT:
 			/* Try again */
 			if (++request->rkbuf_retries <
 			    /* FIXME: producer? */
@@ -3133,7 +3142,7 @@ static int rd_kafka_broker_fetch_toppars (rd_kafka_broker_t *rkb) {
 		tp->PartitionArrayCnt = htonl(1);
 		tp->Partition = htonl(rktp->rktp_partition);
 		tp->FetchOffset = htobe64(rktp->rktp_next_offset);
-		tp->MaxBytes = htonl(rkb->rkb_rk->rk_conf.max_msg_size);
+		tp->MaxBytes = htonl(rkb->rkb_rk->rk_conf.fetch_msg_max_bytes);
 		rd_kafka_buf_push(rkbuf, tp, sizeof(*tp));
 		next = (void *)(tp+1);
 
